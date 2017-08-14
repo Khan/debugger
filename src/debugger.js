@@ -158,6 +158,18 @@ class Debugger {
         }
     }
 
+	evaluate(cmd) {
+        // TODO(slim): Need to transform commands, specifically
+        // variable references and assignments.
+        var result;
+        result = this._currentStepper.evaluate(cmd);
+
+        // TODO(slim): Handle these cases differently
+		// if (this._paused) { } else { }
+        console.log(result);
+        return result;
+	}
+
     // TODO: use this in the demo to exit debug mode
     stop() {
         this.done = true;

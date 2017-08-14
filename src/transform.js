@@ -6,6 +6,21 @@ var esprima = require("esprima-fb");
 var estraverse = require("estraverse");
 var regenerator = require("regenerator");
 
+const REPL_HOOK_CODE = `var __BLOCKED = false;
+var __makeRepl = function* () {
+    while (__BLOCKED) {
+        let input = yield {type: "prompt"};
+        let ret;
+        try {
+            ret = eval(input);
+        } catch (evalError) {
+            console.error(evalError);
+        }
+        yield {type: "promptResult", result: ret};
+    }
+};
+__repl = __makeRepl();
+`;
 
 var expressionStatement = function(expression) {
     return {
@@ -14,11 +29,19 @@ var expressionStatement = function(expression) {
     };
 };
 
-var yieldExpression = function(expression) {
+var yieldExpression = function(expression, delegate = false) {
     return {
         type: "YieldExpression",
-        argument: expression
+        argument: expression,
+        delegate: delegate,
     };
+};
+
+var evalYieldExpression = function(expression) {
+    return callExpression(
+        identifier("eval"),
+        [yieldExpression(expression)]
+    );
 };
 
 var assignmentExpression = function(operator, left, right) {
@@ -45,7 +68,7 @@ var functionDeclaration = function(id, params, body, generator) {
         params: params,
         body: body,
         generator: generator
-    }
+    };
 };
 
 var functionExpression = function(params, body, generator) {
@@ -54,13 +77,21 @@ var functionExpression = function(params, body, generator) {
         params: params,
         body: body,
         generator: generator
-    }
+    };
 };
 
 var blockStatement = function(body) {
     return {
         type: "BlockStatement",
         body: body
+    };
+};
+
+var whileStatement = function(test, body) {
+    return {
+        type: "WhileStatement",
+        test: test,
+        body: body,
     };
 };
 
@@ -328,8 +359,42 @@ var shallowObjectExpression = function(obj) {
     }));
 };
 
+var insertReplHook = function(yieldedValue) {
+    return sequenceExpression([
+        // eval(yield <obj>)
+        // Lets us pass in code, like `__BLOCKED = false`.
+        evalYieldExpression(yieldedValue),
+
+        /**
+         * Simulate a REPL by delegating to `__repl()`.
+         *
+         * yield* (function* () {
+         *    while (__BLOCKED) {
+         *       eval(yield {type: "replOuterLoop"});
+         *    }
+         * })()
+        */
+        yieldExpression(  // yield* (...
+            callExpression(  // function* () {
+                functionExpression([], blockStatement([
+                    whileStatement(  // while (__BLOCKED) {
+                        identifier("__BLOCKED"),
+                        blockStatement([
+                            // eval(yield { type: "replOuterLoop" })
+                            evalYieldExpression(
+                                shallowObjectExpression({
+                                    type: "replOuterLoop"
+                                }))])) // }
+                ]), true),  // generator = true
+            // }
+            []), true)  // delegate = true
+        // )()
+    ]);
+};
+
 var yieldObject = function(obj, loc) {
-    var stmt = expressionStatement(yieldExpression(shallowObjectExpression(obj)));
+    const objExpr = shallowObjectExpression(obj);
+    var stmt = expressionStatement(insertReplHook(objExpr));
     if (loc) {
         stmt.loc = loc;
     }
@@ -345,7 +410,7 @@ var wrapExpression = function(expr, nextExpr) {
     } else {
         obj.stepAgain = true;
     }
-    return yieldExpression(shallowObjectExpression(obj));
+    return insertReplHook(shallowObjectExpression(obj));
 };
 
 
@@ -364,7 +429,10 @@ var addScopeDict = function(bodyList) {
     var scopeName = "$scope$" + (scopeStack.size - 1);
     var scope = scopeStack.peek();
 
-    bodyList.first.value.expression.argument.properties.push(
+    const firstSeqExpr = bodyList.first.value.expression;
+    const firstEval = firstSeqExpr.expressions[0];
+    const properties = firstEval.arguments[0].argument.properties;
+    properties.push(
         property(identifier("scope"), identifier(scopeName))
     );
 
@@ -393,8 +461,13 @@ var getFunctionName = function(node, path) {
 var compile = function(ast, options) {
     var debugCode, generator;
 
+	// NOTE(slim): Temporary hack.
+	options.nativeGenerators = true;
+	options.debug = true;
+
     if (options.nativeGenerators) {
         debugCode = `return function*(${contextName}) {
+            ${REPL_HOOK_CODE}
             ${escodegen.generate(ast)}
         }`;
 
@@ -415,7 +488,7 @@ var compile = function(ast, options) {
         generator = new Function(debugCode + "\n" + "return entry;");
     }
 
-    if (options.debug) {
+    if (options.debug || true) {
         console.log(debugCode);
     }
 
@@ -428,6 +501,19 @@ var contextName;
 var scopeStack;
 var path;
 
+/**
+ * TODO(slim): Modify this to transform REPL commands, specifically:
+ * - FunctionDeclaration
+ * - Identifier
+ * - CallExpression
+ * - VariableDeclaration
+ * - AssignmentExpression
+ * - MemberExpression
+ * - ...and possibly others?
+ *
+ * Can't just pass them through this function, because we don't want to
+ * add `yield` statements.
+ */
 var transform = function(code, _context, options) {
     let ast = esprima.parse(code, { loc: true });
     let scopeManager = escope.analyze(ast);
@@ -500,7 +586,10 @@ var transform = function(code, _context, options) {
                 if (functionName) {
                     // modify the first yield statement so that the object
                     // returned contains the function's name
-                    bodyList.first.value.expression.argument.properties.push(
+                    const firstSeqExpr = bodyList.first.value.expression;
+                    const firstEval = firstSeqExpr.expressions[0];
+                    const properties = firstEval.arguments[0].argument.properties;
+                    properties.push(
                         property(identifier("name"), literal(functionName))
                     );
 
@@ -537,7 +626,8 @@ var transform = function(code, _context, options) {
                     property(identifier("stepAgain"), literal(true))
                 ];
 
-                let expr = yieldExpression(objectExpression(properties));
+                let objExpr = objectExpression(properties);
+                let expr = insertReplHook(objExpr);
                 expr.loc = node.loc;
                 return expr;
             } else if (node.type === "DebuggerStatement") {

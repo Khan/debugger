@@ -205,13 +205,15 @@ class Stepper {
         //};
     }
 
-    _step() {
+    _step(cmd) {
         if (this.stack.isEmpty) {
             return;
         }
         try {
             var frame = this.stack.peek();
-            var result = frame.gen.next(this._retVal);
+            // TODO(slim): Make this work with return values.
+            // var result = frame.gen.next(this._retVal);
+            var result = frame.gen.next("__BLOCKED = false");
             this._retVal = undefined;
 
             // if the result.value contains scope information add it to the
@@ -260,6 +262,16 @@ class Stepper {
             }
         }
 
+        return result;
+    }
+
+    evaluate(cmd) {
+        // TODO(slim): Eliminate magic string identifiers, like `__repl`.
+        // Also, figure out the appropriate number of times to iterate
+        // the `__repl`. Also, come up with a more robust solution.
+        var frame = this.stack.peek();
+        var cmd = `__repl.next(); __repl.next(${cmd}); __repl.next(${cmd})`;
+        var result = frame.gen.next(cmd);
         return result;
     }
 
